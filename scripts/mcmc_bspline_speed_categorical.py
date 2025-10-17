@@ -372,6 +372,17 @@ class BN_LTE_MCMC_BSpline_Optimized:
 
                 self.state.sigma2[j] = np.clip(sigma, 1e-6, 1e6)
 
+    
+    def _update_sigma2_categorical(self) -> None:
+        """Vectorized sigma2 update for categorical data"""
+        resid = compute_residuals_fast(self.X, self._baseline_contrib, self._edge_contrib, self._no_incoming)
+        
+        shape = self.h.nu_sigma + (self.n * 0.5)
+        
+        for j in range(self.p):
+            if self._categorical[j]:
+                scale = 0.5 * np.sum(resid[:, j] ** 2)
+                self.state.sigma2[j] = st.binom.rvs(n=1, p=scale)
 
 
     def _update_gamma(self) -> None:
