@@ -70,12 +70,8 @@ def has_cycle_fast(A: np.ndarray) -> bool:
                     stack.append(w)
 
 
-
     
     return seen < p
-
-
-
 
 @jit(nopython=True, cache=True)
 def compute_residuals_fast(X: np.ndarray, baseline: np.ndarray, edges: np.ndarray, no_incoming: np.ndarray) -> np.ndarray:
@@ -204,7 +200,8 @@ class BN_LTE_MCMC_BSpline_Optimized:
         print_every: int = 10,
         families: Optional[List[List[int]]] = None,
         family_matrix: Optional[np.ndarray] = None,
-        degree: int = 3
+        degree: int = 3,
+        scaler: Optional[object] = None
     ) -> None:
         if seed is not None:
             np.random.seed(seed)
@@ -221,12 +218,11 @@ class BN_LTE_MCMC_BSpline_Optimized:
         self.family_matrix = family_matrix
         
 
-        # X = np.asarray(X, np.float64)  
-        # col_mu, col_sd = X.mean(0), X.std(0, ddof=1)
-        # col_sd[col_sd == 0] = 1.0
-        # self.Xraw_mu, self.Xraw_sd = col_mu, col_sd
-        # self.X = (X - col_mu) / col_sd
-        self.X = np.asarray(X, np.float64)
+        X = np.asarray(X, np.float64)  
+        col_mu, col_sd = X.mean(0), X.std(0, ddof=1)
+        col_sd[col_sd == 0] = 1.0
+        self.Xraw_mu, self.Xraw_sd = col_mu, col_sd
+        self.X = (X - col_mu) / col_sd
         self.n, self.p = self.X.shape
 
         self.corr_matrix = np.corrcoef(self.X, rowvar=False)
@@ -235,6 +231,7 @@ class BN_LTE_MCMC_BSpline_Optimized:
         self.pc1 = pca.fit_transform(self.X)[:, 0]
         self.pc_mean = np.mean(self.pc1)
         self.pc_direction = np.sign(np.mean(pca.components_[0]))  # Optional: Adjust sign if you know the expected direction (e.g., positive if most biomarkers increase with progression)
+        # self.pc_direction = -1.0
         print(f"PCA direction: {self.pc_direction}")
         self.pc1 *= self.pc_direction  # Flip PC1 if needed to ensure "positive" direction aligns with expected progression
 
@@ -263,14 +260,13 @@ class BN_LTE_MCMC_BSpline_Optimized:
 
         sigma3 =  st.gamma.rvs(a=self.a_t, scale=self.b_t)
 
-        z0 = np.random.uniform(0.1, 0.9, self.n)
+        z_rank = np.argsort(np.argsort(self.pc1))  # Ranks of pc1
+        z0 = z_rank / (self.n - 1)  # Normalize ranks to [0, 1]
+        z_rank = np.argsort(self.X[:,-1])
+        z0 = z_rank / (self.n - 1)
 
-        # z_order = np.argsort(self.X[:, -1])  # Indices that sort X[:, 14]
-
-        # z0 = np.linspace(0, 1, self.n)[z_order]  # z increases with X[:, 14]
-
-        self._basis_beta = bspline_basis(z0, K=self.K_beta)
-        self._basis_gamma = bspline_basis(z0, K=self.K_gamma)
+        self._basis_beta = bspline_basis(z0, K=self.K_beta, degree=self.degree)
+        self._basis_gamma = bspline_basis(z0, K=self.K_gamma, degree=self.degree)
 
         self._BtB_beta = self._basis_beta.T @ self._basis_beta
         self._BtB_gamma = self._basis_gamma.T @ self._basis_gamma
@@ -318,77 +314,10 @@ class BN_LTE_MCMC_BSpline_Optimized:
 
         self.RtR_gamma = _second_diff_penalty(self.K_gamma)
         
+        # self.scaler = scaler
+        # self._chol_cache = {}
+        # self.original_vars = np.var(self.X * self.scaler.scale_ + self.scaler.mean_, axis=0)
 
-        self._chol_cache = {}
-
-
-    def subinterval_cycle_check(
-        self,
-        j: int,
-        l: int,
-        r_temp: np.ndarray,
-        epsilon: float = 1e-4,
-        num_check_points: int = 7
-    ) -> bool:
-        """
-        Debug version with detailed diagnostics
-        """
-        if not r_temp.any():
-            return False
-        
-        # Use points away from boundaries
-        check_points = np.linspace(0.2, 0.8, num_check_points)  # Changed from 0.1-0.9
-        
-        for idx, z_val in enumerate(check_points):
-            basis_val = bspline_basis_single_row(
-                z_val, K=self.K_beta, degree=self.degree, t=self.t_beta
-            )
-            
-            edge_mat = np.zeros((self.p, self.p))
-            edge_strengths = []  # Track edge strengths for debugging
-            
-            for target in range(self.p):
-                if self._no_incoming[target]:
-                    continue
-                    
-                for source in range(self.p):
-                    if source == target or self.forbidden[target, source]:
-                        continue
-                    
-                    if target == j and source == l:
-                        coeff = self.state.beta[j, l] * r_temp
-                    else:
-                        coeff = self.state.beta[target, source] * self.state.r[target, source]
-                    
-                    if np.any(coeff):
-                        b_val = basis_val @ coeff
-                        if abs(b_val) > epsilon:
-                            edge_mat[source, target] = 1.0
-                            edge_strengths.append((source, target, b_val))
-            
-            # Detailed diagnostics for first checkpoint
-            if idx == 0:
-                n_edges = int(edge_mat.sum())
-                print(f"\nCheckpoint z={z_val:.2f}: {n_edges} active edges")
-                if n_edges > 0:
-                    print(f"  Basis at z={z_val}: min={basis_val.min():.3e}, max={basis_val.max():.3e}")
-                    print(f"  Top 5 strongest edges:")
-                    edge_strengths.sort(key=lambda x: abs(x[2]), reverse=True)
-                    for src, tgt, strength in edge_strengths[:5]:
-                        print(f"    {src}->{tgt}: {strength:.3e}")
-            
-            if has_cycle_fast(edge_mat):
-                if idx == 0:
-                    print(f"  *** CYCLE DETECTED at checkpoint {idx+1}/{num_check_points}")
-                    # Show the proposed edge
-                    coeff_proposed = self.state.beta[j, l] * r_temp
-                    b_val_proposed = basis_val @ coeff_proposed
-                    print(f"  Proposed edge {l}->{j}: strength={b_val_proposed:.3e}")
-                    print(f"  r_temp: {r_temp}")
-                    print(f"  beta[{j},{l}]: {self.state.beta[j, l]}")
-                return True
-        
-        return False
 
 
     def _update_baseline_contrib(self) -> None:
@@ -461,6 +390,11 @@ class BN_LTE_MCMC_BSpline_Optimized:
             
             y = self.X[:, j] - self._edge_contrib[:, j]
             tau_gamma = np.clip(self.state.tau_gamma[j], 1e-2, 1e4)  # Bound tau_gamma
+            # var_scale = self.original_vars[j] / np.median(self.original_vars)  # Relative to median (agnostic)
+            # penalty_scale = 1.0 + np.log1p(var_scale)  # Mild boost for high-var (e.g., +1–3x)
+            # penalty_scale *= 20
+            # print(f"Var scale for var {j}: {var_scale}, penalty scale: {penalty_scale}")
+            # Qt = BtB / sigma2[j] + (self.RtR_gamma * penalty_scale) / tau_gamma + 1e-4 * np.eye(self.K_gamma)
             Qt = BtB / sigma2[j] + self.RtR_gamma / (tau_gamma) + 1e-4 * np.eye(self.K_gamma)
             
             # Log diagnostics
@@ -471,7 +405,8 @@ class BN_LTE_MCMC_BSpline_Optimized:
             try:
                 L = np.linalg.cholesky(Qt)
                 m = np.linalg.solve(L.T, np.linalg.solve(L, self._basis_gamma.T @ y)) / sigma2[j]
-                self.state.gamma[j] = st.multivariate_normal.rvs(mean=m, cov=np.linalg.inv(Qt))
+                # self.state.gamma[j] = st.multivariate_normal.rvs(mean=m, cov=np.linalg.inv(Qt))
+                self.state.gamma[j] = np.zeros(self.K_gamma)
             except np.linalg.LinAlgError:
                 print(f"LinAlgError in _update_gamma, j={j}, sigma2={sigma2[j]}, tau_gamma={tau_gamma}")
                 continue
@@ -529,7 +464,7 @@ class BN_LTE_MCMC_BSpline_Optimized:
             self.state.sigma3 = proposed
 
 
-    def _update_beta_and_r_blocked(self, it) -> None:
+    def _update_beta_and_r_blocked(self) -> None:
         """Optimized beta and r update"""
         sigma2 = self.state.sigma2
         sigma3 = self.state.sigma3
@@ -569,20 +504,11 @@ class BN_LTE_MCMC_BSpline_Optimized:
  
                     p_on = 1.0 / (1.0 + np.exp(-np.clip(logit, -50, 50)))
                     r_temp[k] = rng.random() < p_on
-
                 if r_temp.any() and not self.state.r[j, l].any():
                     edge_mat = self.state.r.any(axis=2).copy().T
                     edge_mat[l, j] = 1
                     if has_cycle_fast(edge_mat):
-                        r_temp = self.state.r[j,l]
-
-                
-
-                # if r_temp.any() and not self.state.r[j, l].any():
-                #     print('check for l:', l, 'j:', j)
-                #     if self.subinterval_cycle_check(j, l, r_temp):
-                #         r_temp = self.state.r[j, l]  # Reject if cycle in any subinterval
-                
+                        r_temp[:] = self.state.r[j, l]
                 self.state.r[j, l] = r_temp
                             
 
@@ -626,7 +552,6 @@ class BN_LTE_MCMC_BSpline_Optimized:
                         beta_draw = np.atleast_1d(beta_draw)
                         self.state.beta[j, l, :] = 0.0
                         self.state.beta[j, l, mask] = beta_draw
-                        # print('beta: ', self.state.beta[j,l,mask])
                         y -= D_act @ beta_draw
                     except np.linalg.LinAlgError:
                         continue
@@ -654,7 +579,7 @@ class BN_LTE_MCMC_BSpline_Optimized:
     def _log_prior_z_delta(self, i: int, z_old: float, z_new: float) -> float:
         """Fast z prior delta computation"""
         a, b = 2.0, 2.0
-        gamma = 1
+        gamma = 0.2
         eps = 1e-9
         
         dbeta = (a - 1) * (np.log(z_new) - np.log(z_old)) + (b - 1) * (np.log1p(-z_new) - np.log1p(-z_old))
@@ -670,9 +595,8 @@ class BN_LTE_MCMC_BSpline_Optimized:
         dalign = lambda_align * ((z_new - z_old) * (self.pc1[i] - self.pc_mean))
 
         # print(f"z[{i}] change: {z_old:.3f} -> {z_new:.3f}, dbeta: {dbeta:.3f}, dcoul: {dcoul:.3f}, penalty: {penalty if 'penalty' in locals() else 0.0:.3f}, total: {dbeta + dcoul:.3f}")
-        # return dalign
-        return dbeta + dcoul
-    
+        return  dbeta + dcoul 
+
     def _update_z_single_row(self, it) -> None:
         """Optimized z update"""
         sigma2 = self.state.sigma2
@@ -687,9 +611,9 @@ class BN_LTE_MCMC_BSpline_Optimized:
                 z_prop = 2 - z_prop
 
             b_old_beta = self._basis_beta[i]
-            b_new_beta = bspline_basis_single_row(z_prop, K=self.K_beta, t=self.t_beta)
+            b_new_beta = bspline_basis_single_row(z_prop, K=self.K_beta, t=self.t_beta, degree=self.degree)
             b_old_gamma = self._basis_gamma[i]
-            b_new_gamma = bspline_basis_single_row(z_prop, K=self.K_gamma, t=self.t_gamma)
+            b_new_gamma = bspline_basis_single_row(z_prop, K=self.K_gamma, t=self.t_gamma, degree=self.degree)
 
             delta_edge = np.zeros(self.p)
             active_j = np.where(~self._no_incoming)[0]
@@ -709,8 +633,6 @@ class BN_LTE_MCMC_BSpline_Optimized:
 
             z_prop_vec = np.delete(self.state.z, i)
             z_prop_vec = np.insert(z_prop_vec, i, z_prop)
-
-                
             
             lp_delta = self._log_prior_z_delta(i, z_old, z_prop)
             
@@ -741,7 +663,6 @@ class BN_LTE_MCMC_BSpline_Optimized:
         a = self.h.a_rho + self.state.r.sum()
         b = self.h.b_rho + np.prod(self.state.r.shape) - self.state.r.sum()
         self.state.rho = np.random.beta(a, b)
-
 
 
     def _update_tau_gamma(self):
@@ -785,13 +706,13 @@ class BN_LTE_MCMC_BSpline_Optimized:
                 self._BtB_beta = self._basis_beta.T @ self._basis_beta
                 self._BtB_gamma = self._basis_gamma.T @ self._basis_gamma
 
-            # if it < burnin // 2:
-            #     self.z_step = min(0.4, self.z_step * 1.1)
+            if it < burnin // 2:
+               self.z_step = min(0.4, self.z_step * 1.1)
             
             self._update_sigma2()
             self._update_gamma()
             self._update_tau_gamma()
-            self._update_beta_and_r_blocked(it=it)
+            self._update_beta_and_r_blocked()
             self._update_rho()
             self._update_beta()
             self._update_tau2_mh()
